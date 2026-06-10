@@ -28,9 +28,11 @@ from mcs import MCSModule
 
 
 class ActionSensor(Component):
-    """Reads the selector's main site (one-hot over 5 actions), then
-    LEGALITY-MASKS by reading current history from state. If selected
-    action is illegal, falls back to highest-Q legal action."""
+    """Decides the action actually PLAYED from the cam Pool (which combines the
+    learned bottom Q-values with the fixed rule recommendations — the override
+    mechanism), legality-masks it, writes it to game state, AND overwrites the
+    selector's recorded action so the TD update learns the value of the action
+    that was actually played (off-policy attribution alignment)."""
 
     def __init__(self, name, root, acs_module, state):
         super().__init__(name)
@@ -46,40 +48,42 @@ class ActionSensor(Component):
         d = self.root.d
         b = self.root.b
         wm = b.main.wm
+        action_names = ["check", "min_raise", "max_raise", "call", "fold"]
 
-        # Read current history (string)
+        # Legal actions in the current betting context.
         hist_str = _read_hist(self.state.history[0], d)
         legal_strs = LEGAL_ACTIONS.get(hist_str, [])
 
-        # Read Q-values BEFORE selection (from pool's main, the input to
-        # TDLearning). This gives us the unmasked preferences.
+        # BEHAVIOUR: read the cam Pool output, which combines the learned
+        # bottom-level Q-values with the fixed rule recommendations. This is
+        # where a strong learned bottom signal can override an explicit rule.
         pool_out = self.acs.pool.main[0]
-        action_names = ["check", "min_raise", "max_raise", "call", "fold"]
-        q_vals = {}
-        for an in action_names:
-            key = ~wm * ~getattr(d.action, an)
-            q_vals[an] = pool_out.d.get(key, 0.0)
+        pool_vals = {an: pool_out.d.get(~wm * ~getattr(d.action, an), 0.0)
+                     for an in action_names}
 
-        # First check what the selector actually picked
-        sel = self.acs.selector.main[0]
-        picked = None
-        for an in action_names:
-            if sel.d.get(~wm * ~getattr(d.action, an), 0.0) > 0.5:
-                picked = an
-                break
+        # Choose the highest-valued LEGAL action from the cam combination.
+        # (Pool output is already the combined preference; we pick greedily
+        # among legal actions. Exploration comes from the selector's Boltzmann
+        # sampling, which the bottom level learns from — see alignment below.)
+        chosen = max(legal_strs, key=lambda a: pool_vals[a])
 
-        # If picked is legal, use it. Otherwise pick highest-Q legal.
-        if picked in legal_strs:
-            chosen = picked
-        else:
-            chosen = max(legal_strs, key=lambda a: q_vals[a])
-
-        return Event(self.report_action, [
+        updates = [
             ForwardUpdate(self.state.action_taken,
                 _onehot_action_for_player(d, "p1", chosen), "write"),
             ForwardUpdate(self.state.last_actor,
                 _onehot_player(d, "p1"), "write"),
-        ], dt, priority)
+        ]
+
+        # ATTRIBUTION ALIGNMENT: overwrite the selector's recorded action with
+        # the action actually played, so the upcoming TD update trains
+        # Q(s, a_played) rather than Q(s, a_selector-sampled). The selector's
+        # `actions` site is a one-hot over the action domain.
+        played_onehot = {~wm * ~getattr(d.action, an): (1.0 if an == chosen else 0.0)
+                         for an in action_names}
+        updates.append(
+            ForwardUpdate(self.acs.selector.actions, played_onehot, "write"))
+
+        return Event(self.report_action, updates, dt, priority)
 
 
 class PokerSimulation(Agent):
@@ -141,6 +145,8 @@ class PokerSimulation(Agent):
             "p1_card": hand_data["p1_card"],
             "p2_card": hand_data["p2_card"],
             "p1_first_action": p1_first[1] if p1_first else None,
+            "p1_actions": [a for (p, a) in actions if p == "p1"],
+            "all_actions": list(actions),
             "reward_p1": hand_data["reward_p1"],
             "cum_profit": cum_profit,
             "pot_won": hand_data["pot_won"],

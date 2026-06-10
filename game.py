@@ -22,9 +22,9 @@ from keyspace import PokerKeyspace
 
 
 # ─── Constants ───────────────────────────────────────────────────────────
-STARTING_STACK = 150.0
-BLIND = 5.0
-INITIAL_POT = 2 * BLIND   # $10
+STARTING_STACK = 120.0
+BLIND = 6.0
+INITIAL_POT = 2 * BLIND   # $12  (even, so half/full-pot raises and splits stay even)
 _RANK = {"j": 0, "q": 1, "k": 2}
 
 
@@ -177,8 +177,10 @@ class Dealer(Component):
         new_opp_stack   = opp_money - BLIND
         new_pot         = INITIAL_POT
 
-        # Deal cards
-        deck = ["j", "q", "k"]
+        # Deal cards from a 12-card deck (4 each of J, Q, K), without
+        # replacement. Unlike the old 1-each deck, the two dealt cards can now
+        # share a rank (e.g. both Q) -> a tie at showdown, which splits the pot.
+        deck = ["j", "q", "k"] * 4
         self._rng.shuffle(deck)
         c1, c2 = deck[0], deck[1]
 
@@ -304,7 +306,8 @@ class GameTracker(Component):
         updates = []
         terminal = False
         next_hist = None
-        winner_p1 = None     # None if showdown needed
+        winner_p1 = None     # None if showdown needed; bool at a decided showdown
+        is_tie = False       # True at a showdown where both cards share a rank
         pot_after_action = pot
 
         if action == "check":
@@ -312,8 +315,10 @@ class GameTracker(Component):
             next_hist = self._after_check(seq, actor)
             if next_hist == "terminal_showdown":
                 terminal = True
-                winner_p1 = _RANK[_read_oh(self.state.card_p1[0], d.card, ["j","q","k"])] > \
-                            _RANK[_read_oh(self.state.card_p2[0], d.card, ["j","q","k"])]
+                r1 = _RANK[_read_oh(self.state.card_p1[0], d.card, ["j","q","k"])]
+                r2 = _RANK[_read_oh(self.state.card_p2[0], d.card, ["j","q","k"])]
+                is_tie = (r1 == r2)
+                winner_p1 = (r1 > r2)
         elif action in ("min_raise", "max_raise"):
             # Actor pays raise_amount into the pot
             if actor == "p1":
@@ -347,40 +352,71 @@ class GameTracker(Component):
             # Call always ends the hand (no re-raises in v2)
             terminal = True
             next_hist = "terminal_showdown"
-            winner_p1 = _RANK[_read_oh(self.state.card_p1[0], d.card, ["j","q","k"])] > \
-                        _RANK[_read_oh(self.state.card_p2[0], d.card, ["j","q","k"])]
+            r1 = _RANK[_read_oh(self.state.card_p1[0], d.card, ["j","q","k"])]
+            r2 = _RANK[_read_oh(self.state.card_p2[0], d.card, ["j","q","k"])]
+            is_tie = (r1 == r2)
+            winner_p1 = (r1 > r2)
         elif action == "fold":
             # Folder loses; opponent wins pot
             terminal = True
             next_hist = "terminal_fold"
             winner_p1 = (actor == "p2")    # P2 folded → P1 wins
 
-        # On terminal, transfer pot to winner
+        # On terminal, transfer pot (or split it on a tie)
         if terminal:
-            winner_stack_site = self.state.agent_stack if winner_p1 \
-                                else self.state.opp_stack
-            cur_winner_stack = (agent_stack if winner_p1 else opp_stack)
-            # Account for stack changes from THIS action that haven't yet been applied
-            if action in ("min_raise", "max_raise") and ((actor == "p1") == winner_p1):
-                cur_winner_stack -= raise_amount
-            elif action == "call" and ((actor == "p1") == winner_p1):
-                cur_winner_stack -= last_raise
-            new_winner_stack = cur_winner_stack + pot_after_action
-            updates.append(ForwardUpdate(winner_stack_site,
-                {~d.money.amount: new_winner_stack}, "write"))
-            updates.append(ForwardUpdate(self.state.pot,
-                {~d.money.amount: 0.0}, "write"))
-            updates.append(ForwardUpdate(self.state.history,
-                _onehot_hist(d, next_hist), "write"))
-            updates.append(ForwardUpdate(self.state.phase,
-                _onehot_phase(d, "terminal"), "write"))
+            if is_tie:
+                # SPLIT POT. At any showdown both players have matched their
+                # contributions, so returning half the (even) pot to each gives
+                # each player back exactly what they put in -> chip_delta = 0 for
+                # both. A true neutral outcome: not a win, not a loss, so it
+                # cannot bias the agent's greedy exploration in either direction.
+                half = pot_after_action / 2.0
+                # Apply this action's not-yet-applied commitment, then refund half.
+                p1_pending = (raise_amount if (action in ("min_raise","max_raise") and actor == "p1")
+                              else last_raise if (action == "call" and actor == "p1")
+                              else 0.0)
+                p2_pending = (raise_amount if (action in ("min_raise","max_raise") and actor == "p2")
+                              else last_raise if (action == "call" and actor == "p2")
+                              else 0.0)
+                new_agent_stack = agent_stack - p1_pending + half
+                new_opp_stack   = opp_stack   - p2_pending + half
+                updates.append(ForwardUpdate(self.state.agent_stack,
+                    {~d.money.amount: new_agent_stack}, "write"))
+                updates.append(ForwardUpdate(self.state.opp_stack,
+                    {~d.money.amount: new_opp_stack}, "write"))
+                updates.append(ForwardUpdate(self.state.pot,
+                    {~d.money.amount: 0.0}, "write"))
+                updates.append(ForwardUpdate(self.state.history,
+                    _onehot_hist(d, next_hist), "write"))
+                updates.append(ForwardUpdate(self.state.phase,
+                    _onehot_phase(d, "terminal"), "write"))
+                final_agent_stack = new_agent_stack
+            else:
+                winner_stack_site = self.state.agent_stack if winner_p1 \
+                                    else self.state.opp_stack
+                cur_winner_stack = (agent_stack if winner_p1 else opp_stack)
+                # Account for stack changes from THIS action that haven't yet been applied
+                if action in ("min_raise", "max_raise") and ((actor == "p1") == winner_p1):
+                    cur_winner_stack -= raise_amount
+                elif action == "call" and ((actor == "p1") == winner_p1):
+                    cur_winner_stack -= last_raise
+                new_winner_stack = cur_winner_stack + pot_after_action
+                updates.append(ForwardUpdate(winner_stack_site,
+                    {~d.money.amount: new_winner_stack}, "write"))
+                updates.append(ForwardUpdate(self.state.pot,
+                    {~d.money.amount: 0.0}, "write"))
+                updates.append(ForwardUpdate(self.state.history,
+                    _onehot_hist(d, next_hist), "write"))
+                updates.append(ForwardUpdate(self.state.phase,
+                    _onehot_phase(d, "terminal"), "write"))
 
-            # Reward to MS: agent's final stack delta from hand-start
-            # (positive = won money this hand, negative = lost)
-            final_agent_stack = (new_winner_stack if winner_p1
-                                 else (agent_stack - raise_amount if (action in ("min_raise","max_raise") and actor == "p1")
-                                       else agent_stack - last_raise if (action == "call" and actor == "p1")
-                                       else agent_stack))
+                # Reward to MS: agent's final stack delta from hand-start
+                # (positive = won money this hand, negative = lost)
+                final_agent_stack = (new_winner_stack if winner_p1
+                                     else (agent_stack - raise_amount if (action in ("min_raise","max_raise") and actor == "p1")
+                                           else agent_stack - last_raise if (action == "call" and actor == "p1")
+                                           else agent_stack))
+
             chip_delta = final_agent_stack - (self._stack_at_hand_start or STARTING_STACK)
             updates.append(ForwardUpdate(self.ms_chip_in,
                 {~b.main.rwd * ~d.reward.main: chip_delta}, "write"))
@@ -392,8 +428,8 @@ class GameTracker(Component):
                     "reward_p1": chip_delta,
                     "p1_card": _read_oh(self.state.card_p1[0], d.card, ["j","q","k"]),
                     "p2_card": _read_oh(self.state.card_p2[0], d.card, ["j","q","k"]),
-                    "pot_won": pot_after_action,
-                    "winner": "p1" if winner_p1 else "p2",
+                    "pot_won": (0.0 if is_tie else pot_after_action),
+                    "winner": ("tie" if is_tie else ("p1" if winner_p1 else "p2")),
                     "ended_by": "fold" if action == "fold" else "showdown",
                 })
             self.actions_seq.clear()

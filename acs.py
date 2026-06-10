@@ -1,48 +1,69 @@
 """
-ACS module — v3 (LAST VERSION THAT RUNS trace_learning.py WITHOUT A TRACEBACK).
+ACS module — TWO-PATH design (learning bypasses the cam Pool).
 
-This is a deliberate checkpoint for study. Relative to the final (v5) acs.py,
-this version OMITS the two changes that introduced the tracebacks:
+This mirrors the working Lab 6 pattern on the learning side, which is the key
+fix: the trainable bottom layer feeds the TDLearning selector DIRECTLY, so the
+TD gradient flows back through a clean differentiable Layer (cam is never in the
+gradient path). The earlier design put a cam Pool between bottom and selector;
+because cam has no gradient (cam.grad raises NotImplementedError), no gradient
+ever reached the bottom weights and nothing learned.
 
-  REMOVED (was change #4): the `pool.forward()` trigger in resolve().
-      Adding it made the Pool actually run its forward pass, which on
-      Python 3.14 raised `ValueError: no signature found for builtin CAM`
-      inside the gradient tape.
+  LEARNING PATH (differentiable, identical in shape to Lab 6):
+      ipt -> bottom(Layer) -> selector(TDLearning)
+      The selector selects over the bottom layer's Q-values, computes the TD
+      error, and backpropagates it through `bottom` only. Adam then steps.
 
-  REMOVED (was change #5): the `_patch_cam_signature()` shim.
-      That shim fixed the signature error, but then exposed the deeper issue:
-      `cam.grad(...)` raises NotImplementedError — the cam aggregator is not
-      differentiable in pyClarion, so gradients cannot flow back through the
-      Pool.
+  SELECTION / BEHAVIOUR PATH (forward-only, the cam-override mechanism):
+      (bottom, rules) -> pool(cam)
+      The Pool combines the learned bottom Q-values with the fixed rule
+      recommendations via cam. The ActionSensor (simulation.py) reads the Pool
+      to decide the action actually PLAYED — this is where a strong learned
+      bottom signal can override an explicit rule (the bluffing story).
 
-  KEPT (change #2): the optimizer trigger (optimizer.update on bottom.backward).
-  KEPT (change #3): Pool l=2.
-
-CONSEQUENCE: this version runs cleanly but DOES NOT LEARN. Because nothing
-triggers pool.forward(), the Pool never combines its inputs, never builds a
-tape, and its backward never fires — so the cam gradient code is never reached
-(no error) and the bottom-layer weights never change (no learning). When you
-run trace_learning.py against this file you should see:
-    pool.forward calls : 0
-    bottom.backward    : 0
-    optimizer.update   : 0
-    weight L2 change   : 0.000000
-...and NO traceback.
-
-This is the cleanest place to study what introduced the errors: the tracebacks
-appear the instant you reconnect the learning path (trigger pool.forward), which
-reveals that cam is non-differentiable. The fix for actual learning is NOT to
-re-add these two changes as-is, but to either (Option 1) train the bottom layer
-on a path that bypasses the cam Pool, or (Option 3) give cam a straight-through
-gradient. The Pool/cam stays as the action-SELECTION combiner either way.
+  ATTRIBUTION ALIGNMENT:
+      Because behaviour follows the cam Pool but learning runs on the selector,
+      the selector must learn the value of the action that was actually played.
+      The ActionSensor overwrites the selector's recorded action with the
+      cam-chosen action (see simulation.py). This makes the TD update target
+      Q(s, a_played), which is correct off-policy Q-learning.
 """
 
 from pyClarion import Layer, Pool, ChunkStore
 from pyClarion.components.learning import TDLearning
 from pyClarion.components.optimizers import Adam
 from pyClarion.components.base import Component
+from pyClarion.events import BackwardUpdate, ForwardUpdate
 
 from keyspace import PokerKeyspace
+
+
+# ── Python 3.14 compatibility shim ───────────────────────────────────────
+# The gradient tape calls inspect.signature() on ops. On 3.14 the `cam`
+# INSTANCE has no derivable signature (the CAM class does). We attach an
+# explicit __signature__ so any tape recording succeeds. (cam is now only in
+# the forward-only selection path, so this rarely matters, but it is harmless
+# and future-proofs any differentiable use.)
+def _patch_cam_signature():
+    import inspect
+    from pyClarion.components import ops as _ops
+    cam_instance = getattr(_ops, "cam", None)
+    CAM_cls = getattr(_ops, "CAM", None)
+    if cam_instance is None or CAM_cls is None:
+        return
+    try:
+        inspect.signature(cam_instance)
+        return
+    except (ValueError, TypeError):
+        pass
+    try:
+        call_sig = inspect.signature(CAM_cls.__call__)
+        params = [p for name, p in call_sig.parameters.items() if name != "self"]
+        cam_instance.__signature__ = call_sig.replace(parameters=params)
+    except Exception:
+        pass
+
+
+_patch_cam_signature()
 
 
 class ACSModule(Component):
@@ -67,27 +88,35 @@ class ACSModule(Component):
             self.bottom = Layer(
                 f"{name}.bottom", i=feat_d, o=action_d, l=2)
 
-            # ── Combination ──
-            # l=2 kept (change #3). The default l=1 would overwrite the tape
-            # before any backward arrives; l=2 matches the TD two-step window.
-            self.pool = Pool(f"{name}.pool", p, action_d, l=2)
-            (self.bottom, self.rules) >> self.pool
-
-            # ── Selection + learning ──
-            self.selector = self.pool >> TDLearning(
+            # ── LEARNING PATH: bottom -> selector (Lab 6 pattern) ──
+            # selector.input is bottom.main, so TD backprop flows through the
+            # bottom layer ONLY. This is the differentiable learning path.
+            self.selector = self.bottom >> TDLearning(
                 f"{name}.selector",
                 p=p, s=s, d=action_d, r=reward_d,
                 gamma=gamma, sd=sd, f=0.0, l=2)
+
+            # ── SELECTION PATH: (bottom, rules) -> cam Pool (forward only) ──
+            # The Pool combines learned bottom Q with fixed rule recs for the
+            # behaviour decision. It is never differentiated, so cam's lack of
+            # a gradient is irrelevant here.
+            self.pool = Pool(f"{name}.pool", p, action_d, l=2)
+            (self.bottom, self.rules) >> self.pool
 
             # ── Optimizer (BOTTOM only) ──
             self.optimizer = Adam(f"{name}.optimizer", p, lr=lr)
             self.optimizer.add(self.bottom.weights, self.bottom.bias)
 
     def resolve(self, event):
-        # Optimizer trigger kept (change #2). In THIS version it never actually
-        # fires, because bottom.backward never fires (the Pool never forwards,
-        # so no gradient ever reaches the bottom layer). It is harmless here and
-        # is the correct mechanism once a differentiable learning path exists.
+        forward = event.index(ForwardUpdate)
+        # Drive the cam Pool's forward pass once per decision, after the rules
+        # layer finishes (the later-updating of the Pool's two inputs, so both
+        # bottom.main and rules.main are fresh). This produces the
+        # cam(bottom_Q, rule_recs) the ActionSensor reads for behaviour.
+        if self.rules.main in forward:
+            self.system.schedule(self.pool.forward())
+        # After the bottom layer's backward pass accumulates gradients, trigger
+        # the optimizer to consume and apply them (Adam.resolve is a no-op).
         if event.source == self.bottom.backward:
             self.system.schedule(self.optimizer.update())
 
