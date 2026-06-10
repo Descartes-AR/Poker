@@ -145,6 +145,8 @@ class PokerSimulation(Agent):
             "p1_card": hand_data["p1_card"],
             "p2_card": hand_data["p2_card"],
             "p1_first_action": p1_first[1] if p1_first else None,
+            "p1_actions": [a for (p, a) in actions if p == "p1"],
+            "all_actions": list(actions),
             "reward_p1": hand_data["reward_p1"],
             "cum_profit": cum_profit,
             "pot_won": hand_data["pot_won"],
