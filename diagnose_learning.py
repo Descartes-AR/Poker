@@ -63,7 +63,7 @@ def _q_for(sim, card_name, hist_name, action_name):
     return q
 
 
-def run_with_diagnostics(opp_name, opp_policy, n_hands=2000, seed=0):
+def run_with_diagnostics(opp_name, opp_policy, n_hands=5000, seed=4):
     root = PokerKeyspace()
     hand_log = []
     sim = PokerSimulation(f"diag_{opp_name}", root,
@@ -127,7 +127,7 @@ def run_with_diagnostics(opp_name, opp_policy, n_hands=2000, seed=0):
 
 def main():
     print("=" * 72)
-    print("LEARNING DIAGNOSTICS — short runs (2000 hands each)")
+    print("LEARNING DIAGNOSTICS — short runs (5000 hands each)")
     print("=" * 72)
 
     results = []
@@ -135,7 +135,7 @@ def main():
                        ("rock", rock),
                        ("loose_aggressive", loose_aggressive)]:
         print(f"\nrunning {name} ...")
-        r = run_with_diagnostics(name, pol, n_hands=2000, seed=0)
+        r = run_with_diagnostics(name, pol, n_hands=5000, seed=4)
         results.append(r)
 
         print(f"\n  ── CHECK 1: REWARD DELIVERY ({name}) ──")

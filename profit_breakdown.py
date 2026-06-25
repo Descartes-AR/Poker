@@ -60,7 +60,7 @@ def classify_line(row):
 
 
 def analyze(opp_name, opp_policy, n_hands):
-    df = run_condition(opp_name, opp_policy, n_hands=n_hands, seed=1)
+    df = run_condition(opp_name, opp_policy, n_hands=n_hands, seed=5)
     df["line"] = df.apply(classify_line, axis=1)
 
     total = df["reward_p1"].sum()

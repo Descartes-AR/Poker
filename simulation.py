@@ -28,11 +28,13 @@ from mcs import MCSModule
 
 
 class ActionSensor(Component):
-    """Decides the action actually PLAYED from the cam Pool (which combines the
-    learned bottom Q-values with the fixed rule recommendations — the override
-    mechanism), legality-masks it, writes it to game state, AND overwrites the
-    selector's recorded action so the TD update learns the value of the action
-    that was actually played (off-policy attribution alignment)."""
+    """Plays the SELECTOR's own choice. The selector selects over bottom.main,
+    which the ACS has already augmented with the rule recommendations
+    (learned_Q + rule_bias). So the played action is the combined, overridable
+    choice AND exactly the action the TD update learns from — played == learned
+    by construction, with no overwrite and no attribution race. Only if the
+    selector lands on an illegal action does this fall back to the best legal
+    action and realign the record."""
 
     def __init__(self, name, root, acs_module, state):
         super().__init__(name)
@@ -50,40 +52,42 @@ class ActionSensor(Component):
         wm = b.main.wm
         action_names = ["check", "min_raise", "max_raise", "call", "fold"]
 
-        # Legal actions in the current betting context.
         hist_str = _read_hist(self.state.history[0], d)
         legal_strs = LEGAL_ACTIONS.get(hist_str, [])
 
-        # BEHAVIOUR: read the cam Pool output, which combines the learned
-        # bottom-level Q-values with the fixed rule recommendations. This is
-        # where a strong learned bottom signal can override an explicit rule.
-        pool_out = self.acs.pool.main[0]
-        pool_vals = {an: pool_out.d.get(~wm * ~getattr(d.action, an), 0.0)
-                     for an in action_names}
+        # The selector's chosen action (its one-hot main output).
+        sel = self.acs.selector.main[0]
+        picked = None
+        for an in action_names:
+            if sel.d.get(~wm * ~getattr(d.action, an), 0.0) > 0.5:
+                picked = an
+                break
 
-        # Choose the highest-valued LEGAL action from the cam combination.
-        # (Pool output is already the combined preference; we pick greedily
-        # among legal actions. Exploration comes from the selector's Boltzmann
-        # sampling, which the bottom level learns from — see alignment below.)
-        chosen = max(legal_strs, key=lambda a: pool_vals[a])
+        if picked in legal_strs:
+            # Played == what the selector chose == what it learns. No overwrite.
+            return Event(self.report_action, [
+                ForwardUpdate(self.state.action_taken,
+                    _onehot_action_for_player(d, "p1", picked), "write"),
+                ForwardUpdate(self.state.last_actor,
+                    _onehot_player(d, "p1"), "write"),
+            ], dt, priority)
 
-        updates = [
+        # Safety net: selector picked an illegal action (or none). Fall back to
+        # the best LEGAL action by the combined value in bottom.main, and realign
+        # the selector's record so learning targets the played action. Rule_bias
+        # biases the selector toward legal actions, so this should be uncommon.
+        combined = self.acs.bottom.main[0]
+        vals = {a: combined.d.get(~wm * ~getattr(d.action, a), 0.0) for a in legal_strs}
+        chosen = max(legal_strs, key=lambda a: vals[a]) if legal_strs else "fold"
+        realign = {~wm * ~getattr(d.action, an): (1.0 if an == chosen else 0.0)
+                   for an in action_names}
+        return Event(self.report_action, [
             ForwardUpdate(self.state.action_taken,
                 _onehot_action_for_player(d, "p1", chosen), "write"),
             ForwardUpdate(self.state.last_actor,
                 _onehot_player(d, "p1"), "write"),
-        ]
-
-        # ATTRIBUTION ALIGNMENT: overwrite the selector's recorded action with
-        # the action actually played, so the upcoming TD update trains
-        # Q(s, a_played) rather than Q(s, a_selector-sampled). The selector's
-        # `actions` site is a one-hot over the action domain.
-        played_onehot = {~wm * ~getattr(d.action, an): (1.0 if an == chosen else 0.0)
-                         for an in action_names}
-        updates.append(
-            ForwardUpdate(self.acs.selector.actions, played_onehot, "write"))
-
-        return Event(self.report_action, updates, dt, priority)
+            ForwardUpdate(self.acs.selector.actions, realign, "write"),
+        ], dt, priority)
 
 
 class PokerSimulation(Agent):
