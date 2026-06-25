@@ -64,13 +64,31 @@ def _set_rule_weights(sim, acs_chunks):
     ))
 
 
-def _init_bottom_weights(sim, sd=0.1):
+def _init_bottom_weights(sim, sd=0.1, optimism=8.0):
+    """Initialise the bottom Q-network.
+
+    Weights start as small Gaussian noise. The BIAS for every action is set
+    OPTIMISTICALLY high (a positive constant `optimism`), so that before any
+    action has been tried its estimated value looks attractive. With greedy-ish
+    selection this produces GREED-MOTIVATED exploration: the agent tries an
+    action because it currently looks profitable, and only keeps doing it if the
+    realised reward sustains that value — unprofitable actions (e.g. bluffing the
+    calling station) decay below the alternatives and are abandoned, while
+    profitable ones (bluffing the rock) persist. No exploration temperature is
+    needed; exploration is driven entirely by value optimism, matching the
+    emergence hypothesis. `optimism` should sit above realistic per-hand returns
+    (~|18| with $6 blinds) loosely enough to be 'used up' over training; tune as
+    needed.
+    """
     rng = random.Random(0)
     layer = sim.acs.bottom
     updates = []
-    for site in [layer.weights, layer.bias]:
-        new_vals = {key: rng.gauss(0.0, sd) for key in site.index}
-        updates.append(ForwardUpdate(site, new_vals, "write"))
+    # Weights: small noise.
+    w_vals = {key: rng.gauss(0.0, sd) for key in layer.weights.index}
+    updates.append(ForwardUpdate(layer.weights, w_vals, "write"))
+    # Bias: optimistic constant (+ small noise to break ties).
+    bias_vals = {key: optimism + rng.gauss(0.0, sd) for key in layer.bias.index}
+    updates.append(ForwardUpdate(layer.bias, bias_vals, "write"))
     sim.system.schedule(Event(
         source=_init_bottom_weights, updates=updates,
         time=timedelta(), priority=Priority.LEARNING,

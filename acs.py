@@ -28,7 +28,9 @@ ever reached the bottom weights and nothing learned.
       Q(s, a_played), which is correct off-policy Q-learning.
 """
 
-from pyClarion import Layer, Pool, ChunkStore
+from datetime import timedelta
+
+from pyClarion import Layer, Pool, ChunkStore, Event, Priority
 from pyClarion.components.learning import TDLearning
 from pyClarion.components.optimizers import Adam
 from pyClarion.components.base import Component
@@ -109,11 +111,29 @@ class ACSModule(Component):
 
     def resolve(self, event):
         forward = event.index(ForwardUpdate)
-        # Drive the cam Pool's forward pass once per decision, after the rules
-        # layer finishes (the later-updating of the Pool's two inputs, so both
-        # bottom.main and rules.main are fresh). This produces the
-        # cam(bottom_Q, rule_recs) the ActionSensor reads for behaviour.
+        # ADDITIVE COMBINATION (the override mechanism, done outside the Pool
+        # because cam has no gradient and there is no differentiable aggregator).
+        # When the rules layer finishes its forward pass (both bottom.main and
+        # rules.main are now fresh for this decision), add the state-dependent
+        # rule recommendations directly into bottom.main — the selector's input.
+        # The selector then selects over (learned_Q + rule_bias), and because we
+        # PLAY the selector's own choice (see ActionSensor), the played action IS
+        # the learned action: no overwrite, no attribution race.
+        #
+        # This does not corrupt learning: bottom.backward computes gradients from
+        # its forward tape (W*x + bias), so the added rule offset is a constant
+        # w.r.t. the weights and the TD gradient through `bottom` stays correct.
+        # Early on, learned_Q ~ 0 so behaviour follows the rules; as the bottom
+        # level learns, it can override them — the emergence we want.
         if self.rules.main in forward:
+            rule_vals = dict(self.rules.main[0].d)
+            if rule_vals:
+                self.system.schedule(Event(
+                    source=self.resolve,
+                    updates=[ForwardUpdate(self.bottom.main, rule_vals, "add")],
+                    time=timedelta(), priority=Priority.PROPAGATION))
+            # Keep the Pool fed for the MCS monitor (it no longer drives
+            # behaviour, but the MCS still watches per-level signals).
             self.system.schedule(self.pool.forward())
         # After the bottom layer's backward pass accumulates gradients, trigger
         # the optimizer to consume and apply them (Adam.resolve is a no-op).

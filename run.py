@@ -8,7 +8,7 @@ from knowledge import initialize_all_knowledge
 from opponents import calling_station, rock, loose_aggressive
 
 
-def run_condition(opp_name, opp_policy, n_hands=5000, seed=1):
+def run_condition(opp_name, opp_policy, n_hands=5000, seed=4):
     root = PokerKeyspace()
     hand_log = []
     sim = PokerSimulation(f"sim_{opp_name}", root,
